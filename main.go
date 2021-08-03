@@ -143,10 +143,12 @@ func setupAPIServer(port int, isAuth IsAuthorized, publicKeyBytes []byte) {
 			return User{}, fmt.Errorf("the access token is empty")
 		}
 		verified, err := jws.Verify([]byte(accessToken), jwa.ES512, publicKey)
-		must(err)
+		if err != nil {
+			return User{}, err
+		}
 		var user User
-		must(json.Unmarshal(verified, &user))
-		return user, nil
+		err = json.Unmarshal(verified, &user)
+		return user, err
 	}
 	authorizationMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
@@ -165,7 +167,7 @@ func setupAPIServer(port int, isAuth IsAuthorized, publicKeyBytes []byte) {
 			user, err := getUserFromAccessToken(accessToken)
 			if err != nil {
 				resp.WriteHeader(http.StatusBadRequest)
-				errBytes, e := json.Marshal(map[string]string{"error": err.Error()})
+				errBytes, e := json.Marshal(map[string]string{"error": fmt.Sprintf("the access token is invalid. %v", err)})
 				must(e)
 				resp.Write(errBytes)
 				return
