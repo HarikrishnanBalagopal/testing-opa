@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/lestrrat-go/jwx/jwa"
+	"github.com/lestrrat-go/jwx/jws"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/spf13/cast"
 )
@@ -19,6 +23,14 @@ func must(err error) {
 }
 
 type IDType int
+
+type IsAuthorized = func(subject User, object []string, action string) (bool, error)
+
+type User struct {
+	IDPType   string `json:"idp_type"`
+	IDPID     string `json:"idp_id"`
+	IDPUserID string `json:"idp_user_id"`
+}
 
 type Asset struct {
 	ID   IDType `json:"id"`
@@ -123,17 +135,22 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func getUserFromAccessToken(accessToken string) (string, error) {
-	if accessToken == "" {
-		return "", fmt.Errorf("the access token is empty")
+func setupAPIServer(port int, isAuth IsAuthorized, publicKeyBytes []byte) {
+	publicKey, err := x509.ParsePKIXPublicKey(publicKeyBytes)
+	must(err)
+	getUserFromAccessToken := func(accessToken string) (User, error) {
+		if accessToken == "" {
+			return User{}, fmt.Errorf("the access token is empty")
+		}
+		verified, err := jws.Verify([]byte(accessToken), jwa.ES512, publicKey)
+		must(err)
+		var user User
+		must(json.Unmarshal(verified, &user))
+		return user, nil
 	}
-	// TODO: verify the JWT access token and get the user from the JWT
-	return accessToken, nil
-}
-
-func setupAPIServer(port int, isAuth IsAuthorized) {
 	authorizationMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			resp.Header().Set("Content-Type", "application/json")
 			authHeader := req.Header["Authorization"]
 			if len(authHeader) != 1 {
 				resp.WriteHeader(http.StatusBadRequest)
@@ -187,13 +204,13 @@ func main() {
 	fmt.Println("start")
 	isAuth, err := setupAuth()
 	must(err)
-	setupAPIServer(8080, isAuth)
+	publicKeyBytes, err := ioutil.ReadFile("secrets/pubkey.der")
+	must(err)
+	setupAPIServer(8080, isAuth, publicKeyBytes)
 	fmt.Println("done")
 }
 
 // Authorization
-
-type IsAuthorized = func(subject string, object []string, action string) (bool, error)
 
 func setupAuth() (IsAuthorized, error) {
 	MODULE := `
@@ -202,7 +219,9 @@ package example.authz
 default allow = false
 
 allow {
-	input.subject.id = "john"
+	input.subject.idp_type    = "saml"
+	input.subject.idp_id      = "delta"
+	input.subject.idp_user_id = "john"
 	input.object = ["workspaces", "42"]
 	input.action = "GET"
 }
@@ -218,12 +237,14 @@ is_admin {
 	query, err := rego.New(rego.Query("x = data.example.authz.allow"), rego.Module("example.rego", MODULE)).PrepareForEval(context.TODO())
 	must(err)
 
-	isAuth := func(subject string, object []string, action string) (bool, error) {
+	isAuth := func(subject User, object []string, action string) (bool, error) {
 		fmt.Printf("checking authorization for %s to perform %s on %v\n", subject, action, object)
 		input := map[string]interface{}{
 			"subject": map[string]interface{}{
-				"id":    subject,
-				"roles": GetRolesOfUser(subject),
+				"idp_type":    subject.IDPType,
+				"idp_id":      subject.IDPID,
+				"idp_user_id": subject.IDPUserID,
+				"roles":       GetRolesOfUser(subject),
 			},
 			"object": object,
 			"action": action,
@@ -244,7 +265,7 @@ is_admin {
 	return isAuth, nil
 }
 
-func GetRolesOfUser(user string) []string {
-	ROLES := map[string][]string{"john": {"sales", "marketing"}, "sam": {"manager", "admin"}}
+func GetRolesOfUser(user User) []string {
+	ROLES := map[User][]string{{"saml", "delta", "john"}: {"sales", "marketing"}, {"saml", "delta", "sam"}: {"manager", "admin"}}
 	return ROLES[user]
 }
